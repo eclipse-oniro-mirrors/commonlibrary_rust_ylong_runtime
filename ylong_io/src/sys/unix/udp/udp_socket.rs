@@ -12,13 +12,17 @@
 // limitations under the License.
 
 use std::fmt::Formatter;
+use std::mem::{size_of, MaybeUninit};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::os::unix::io::AsRawFd;
 use std::{fmt, io, net};
 
 use super::UdpSock;
+use super::super::socket_addr::trans_addr_2_socket;
 use crate::source::Fd;
 use crate::{Interest, Selector, Source, Token};
+
+use libc::{gid_t, sockaddr_storage, uid_t};
 
 /// UdpSocket. The bottom layer uses std::net::UdpSocket。
 /// UdpSocket supports bind\connect\send\recv\send_to\recv_from\broadcast.
@@ -88,6 +92,32 @@ impl UdpSocket {
     pub fn bind(addr: SocketAddr) -> io::Result<UdpSocket> {
         let socket = UdpSock::new_socket(addr)?;
         socket.bind(addr)
+    }
+
+    /// Creates a UDP socket from the given address after setting the socket
+    /// owner to the provided uid/gid.
+    /// return io::Error if errors happen.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use std::io;
+    ///
+    /// use ylong_io::UdpSocket;
+    ///
+    /// async fn io_func() -> io::Result<()> {
+    ///     let addr = "127.0.0.1:8080".parse().unwrap();
+    ///     let uid = 1;
+    ///     let gid = 1;
+    ///     if UdpSocket::bind_with_owner(addr, uid, gid).is_ok() {
+    ///         println!("socket binds successfully");
+    ///     };
+    ///     Ok(())
+    /// }
+    /// ```
+    pub fn bind_with_owner(addr: SocketAddr, uid: uid_t, gid: gid_t) -> io::Result<UdpSocket> {
+        let socket = UdpSock::new_socket(addr)?;
+        socket.bind_with_owner(addr, uid, gid)
     }
 
     /// Creates a new `UdpSocket` from a standard `net::UdpSocket`.
@@ -211,6 +241,60 @@ impl UdpSocket {
     pub fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
         let inner = &self.inner;
         inner.recv_from(buf)
+    }
+
+    /// Receives a single datagram message on the socket and reports whether
+    /// the kernel truncated it.
+    ///
+    /// Unlike `recv_from`, which cannot distinguish a datagram that fits
+    /// the buffer from one silently shortened by the kernel, this method
+    /// receives through `recvmsg` and returns the kernel-side truncation
+    /// signal (`MSG_TRUNC` in `msg_flags`), while the leading bytes of the
+    /// datagram are still delivered into `buf`.
+    ///
+    /// # Return value
+    /// The function returns:
+    /// * `Ok((n, addr, truncated))` n is the number of bytes received (at
+    ///   most `buf.len()`, even when the datagram was longer), addr is the
+    ///   address of sender, truncated reports whether the datagram did not
+    ///   fit in the buffer.
+    /// * `Err(e)` if an error is encountered.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use std::io;
+    ///
+    /// use ylong_io::UdpSocket;
+    ///
+    /// async fn io_func() -> io::Result<()> {
+    ///     let local_addr = "127.0.0.1:8080".parse().unwrap();
+    ///     let sock = UdpSocket::bind(local_addr)?;
+    ///     let mut recv_buf = [0_u8; 12];
+    ///     let (len, addr, truncated) = sock.recv_from_truncated(&mut recv_buf)?;
+    ///     println!("received {:?} bytes from {:?}, truncated: {:?}", len, addr, truncated);
+    ///     Ok(())
+    /// }
+    /// ```
+    pub fn recv_from_truncated(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr, bool)> {
+        // The address storage is written by the kernel; use `MaybeUninit` as
+        // `TcpListener::accept` does.
+        let mut addr = MaybeUninit::<sockaddr_storage>::uninit();
+        let mut iov = libc::iovec {
+            iov_base: buf.as_mut_ptr().cast(),
+            iov_len: buf.len(),
+        };
+        // `msghdr` carries private padding fields on some targets (musl/ohos
+        // on 64-bit), so it cannot be built as a struct literal. Zero it and
+        // assign the public fields, like `std` does.
+        let mut mh: libc::msghdr = unsafe { std::mem::zeroed() };
+        mh.msg_name = addr.as_mut_ptr().cast();
+        mh.msg_namelen = size_of::<sockaddr_storage>() as libc::socklen_t;
+        mh.msg_iov = &mut iov;
+        mh.msg_iovlen = 1;
+        let len = syscall!(recvmsg(self.inner.as_raw_fd(), &mut mh, 0))?;
+        let addr = unsafe { trans_addr_2_socket(addr.as_ptr()) }?;
+        Ok((len as usize, addr, mh.msg_flags & libc::MSG_TRUNC != 0))
     }
 
     /// Receives single datagram on the socket from the remote address to which

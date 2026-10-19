@@ -19,6 +19,9 @@ use std::task::{Context, Poll};
 
 use ylong_io::Interest;
 
+#[cfg(target_os = "linux")]
+use libc::{gid_t, uid_t};
+
 use crate::io::ReadBuf;
 use crate::net::sys::ToSocketAddrs;
 use crate::net::AsyncSource;
@@ -113,6 +116,49 @@ impl UdpSocket {
     /// ```
     pub async fn bind<A: ToSocketAddrs>(addr: A) -> io::Result<Self> {
         super::addr::each_addr(addr, ylong_io::UdpSocket::bind)
+            .await
+            .map(UdpSocket::new)
+            .and_then(|op| op)
+    }
+
+    /// Creates a new UDP socket and binds it to the provided address after
+    /// setting the socket ownership to the provided uid/gid.
+    ///
+    /// # Note
+    ///
+    /// If there are multiple addresses in SocketAddr, it will attempt to
+    /// bind them in sequence until one of the addrs returns success. If
+    /// all binds fail, it returns the error of the last bind.
+    /// This behavior is consistent with std.
+    ///
+    /// # Platform support
+    ///
+    /// This function is only available on Linux.
+    ///
+    /// # Panic
+    /// Calling this method outside of a Ylong Runtime could cause panic.
+    ///
+    /// # Example
+    /// ```rust
+    /// use std::io;
+    ///
+    /// use ylong_runtime::net::UdpSocket;
+    ///
+    /// async fn io_func() -> io::Result<()> {
+    ///     let addr = "127.0.0.1:8080";
+    ///     let uid = 1;
+    ///     let gid = 1;
+    ///     let sock = UdpSocket::bind_with_owner(addr, uid, gid).await?;
+    ///     Ok(())
+    /// }
+    /// ```
+    #[cfg(target_os = "linux")]
+    pub async fn bind_with_owner<A: ToSocketAddrs>(
+        addr: A,
+        uid: uid_t,
+        gid: gid_t,
+    ) -> io::Result<Self> {
+        super::addr::each_addr_with_owner(uid, gid, addr, ylong_io::UdpSocket::bind_with_owner)
             .await
             .map(UdpSocket::new)
             .and_then(|op| op)
@@ -348,6 +394,53 @@ impl UdpSocket {
             .await
     }
 
+    /// Receives a single datagram message on the socket and reports whether
+    /// the kernel truncated it.
+    ///
+    /// Unlike `recv_from`, which cannot distinguish a datagram that fits
+    /// the buffer from one silently shortened by the kernel, this method
+    /// receives through `recvmsg` and returns the kernel-side truncation
+    /// signal (`MSG_TRUNC` in `msg_flags`), while the leading bytes of the
+    /// datagram are still delivered into `buf`. This is the truncation
+    /// signal musl `res_msend` uses besides the DNS header TC bit
+    /// (`res_msend.c` L739).
+    ///
+    /// # Return value
+    /// The function returns:
+    /// * `Ok((n, addr, truncated))` n is the number of bytes received (at
+    ///   most `buf.len()`, even when the datagram was longer), addr is the
+    ///   address of the remote, truncated reports whether the datagram did
+    ///   not fit in the buffer.
+    /// * `Err(e)` if an error is encountered.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use std::io;
+    ///
+    /// use ylong_runtime::net::UdpSocket;
+    ///
+    /// async fn io_func() -> io::Result<()> {
+    ///     let local_addr = "127.0.0.1:8080";
+    ///     let sock = UdpSocket::bind(local_addr).await?;
+    ///     let mut recv_buf = [0_u8; 12];
+    ///     let (len, addr, truncated) = sock.recv_from_truncated(&mut recv_buf).await?;
+    ///     println!("received {:?} bytes from {:?}, truncated: {:?}", len, addr, truncated);
+    ///     Ok(())
+    /// }
+    /// ```
+    #[cfg(target_os = "linux")]
+    pub async fn recv_from_truncated(
+        &self,
+        buf: &mut [u8],
+    ) -> io::Result<(usize, SocketAddr, bool)> {
+        self.source
+            .async_process(Interest::READABLE, || {
+                self.source.recv_from_truncated(buf)
+            })
+            .await
+    }
+
     /// Attempts to receive a single datagram message on the socket.
     ///
     /// The function is usually paired with `readable` and must be called with
@@ -381,6 +474,47 @@ impl UdpSocket {
     pub fn try_recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
         self.source
             .try_io(Interest::READABLE, || self.source.recv_from(buf))
+    }
+
+    /// Attempts to receive a single datagram message on the socket,
+    /// reporting the kernel-side `MSG_TRUNC` flag of the datagram.
+    ///
+    /// The function is usually paired with `readable` and must be called
+    /// with valid byte array buf of sufficient size to hold the message
+    /// bytes. If a message is too long to fit in the supplied buffer,
+    /// excess bytes may be discarded.
+    ///
+    /// # Return value
+    /// The function returns:
+    /// * `Ok(n, addr, truncated)` n is the number of bytes received, addr
+    ///   is the address of the remote, truncated is the kernel-side
+    ///   `MSG_TRUNC` flag.
+    /// * `Err(e)` if an error is encountered.
+    /// If there is no pending data, an [`io::ErrorKind::WouldBlock`] will
+    /// be returned.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use std::io;
+    ///
+    /// use ylong_runtime::net::UdpSocket;
+    ///
+    /// async fn io_func() -> io::Result<()> {
+    ///     let local_addr = "127.0.0.1:8080";
+    ///     let sock = UdpSocket::bind(local_addr).await?;
+    ///     let mut recv_buf = [0_u8; 12];
+    ///     let (len, addr, truncated) = sock.try_recv_from_truncated(&mut recv_buf)?;
+    ///     Ok(())
+    /// }
+    /// ```
+    #[cfg(target_os = "linux")]
+    pub fn try_recv_from_truncated(
+        &self,
+        buf: &mut [u8],
+    ) -> io::Result<(usize, SocketAddr, bool)> {
+        self.source
+            .try_io(Interest::READABLE, || self.source.recv_from_truncated(buf))
     }
 
     /// Attempts to receives single datagram on the socket from the remote

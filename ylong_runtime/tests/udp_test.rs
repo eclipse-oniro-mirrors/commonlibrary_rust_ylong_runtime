@@ -15,6 +15,9 @@
 
 use std::{io, thread};
 
+#[cfg(target_os = "linux")]
+use std::os::unix::io::AsRawFd;
+
 use ylong_runtime::net::UdpSocket;
 
 const ADDR: &str = "127.0.0.1:0";
@@ -586,4 +589,234 @@ fn sdv_udp_basic_v6() {
                 .expect("Cannot leave the multicast group!");
         }
     });
+}
+
+#[cfg(target_os = "linux")]
+fn verify_udp_socket_ownership(
+    socket: &UdpSocket,
+    expected_uid: libc::uid_t,
+    expected_gid: libc::gid_t,
+) -> io::Result<bool> {
+    let fd = socket.as_raw_fd();
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+
+    unsafe {
+        if libc::fstat(fd, stat.as_mut_ptr()) != 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        let stat = stat.assume_init();
+        Ok(stat.st_uid == expected_uid && stat.st_gid == expected_gid)
+    }
+}
+
+/// SDV test cases for `bind_with_owner`.
+///
+/// # Brief
+/// 1. Create UdpSocket by `bind_with_owner` with the current uid/gid.
+/// 2. Check the socket owner is set to the expected uid/gid.
+/// 3. Check `local_addr()` works and the port is valid.
+#[test]
+#[cfg(target_os = "linux")]
+fn sdv_udp_bind_with_owner_basic() {
+    let handle = ylong_runtime::spawn(async {
+        let uid = unsafe { libc::getuid() };
+        let gid = unsafe { libc::getgid() };
+
+        let socket = UdpSocket::bind_with_owner(ADDR, uid, gid)
+            .await
+            .expect("Bind Socket With Owner Failed");
+
+        let res = verify_udp_socket_ownership(&socket, uid, gid).unwrap();
+        assert!(res);
+
+        let local_addr = socket.local_addr().expect("local_addr failed");
+        assert!(local_addr.port() > 0);
+    });
+    ylong_runtime::block_on(handle).expect("block_on failed");
+}
+
+/// SDV test cases for `bind_with_owner` when setting the owner fails.
+///
+/// # Brief
+/// 1. As a non-root process, call `bind_with_owner` with a uid different
+///    from the current one, which makes `fchown` fail.
+/// 2. Check the error is returned and the socket is not bound.
+#[test]
+#[cfg(target_os = "linux")]
+fn sdv_udp_bind_with_owner_invalid_owner() {
+    if unsafe { libc::geteuid() } == 0 {
+        // The root user can fchown to any uid; the failure branch cannot be
+        // exercised in this environment.
+        return;
+    }
+    let handle = ylong_runtime::spawn(async {
+        let uid = unsafe { libc::getuid() } + 1;
+        let gid = unsafe { libc::getgid() };
+
+        let res = UdpSocket::bind_with_owner(ADDR, uid, gid).await;
+        let err = res
+            .expect_err("fchown should fail for a foreign uid");
+        assert_eq!(err.raw_os_error(), Some(libc::EPERM));
+    });
+    ylong_runtime::block_on(handle).expect("block_on failed");
+}
+
+/// SDV test cases for the data path of owner-set sockets.
+///
+/// # Brief
+/// 1. Create two UdpSockets by `bind_with_owner` with the current uid/gid.
+/// 2. Send a payload from one to the other with send_to/recv_from.
+/// 3. Check the payload and the peer address round-trip.
+#[test]
+#[cfg(target_os = "linux")]
+fn sdv_udp_bind_with_owner_roundtrip() {
+    let handle = ylong_runtime::spawn(async {
+        let uid = unsafe { libc::getuid() };
+        let gid = unsafe { libc::getgid() };
+
+        let receiver = UdpSocket::bind_with_owner(ADDR, uid, gid)
+            .await
+            .expect("Bind Receiver Failed");
+        let sender = UdpSocket::bind_with_owner(ADDR, uid, gid)
+            .await
+            .expect("Bind Sender Failed");
+        let recv_addr = receiver.local_addr().unwrap();
+        let send_addr = sender.local_addr().unwrap();
+
+        let sender_handle = ylong_runtime::spawn(async move {
+            let n = sender
+                .send_to(b"owned", recv_addr)
+                .await
+                .expect("Sender Send Failed");
+            assert_eq!(n, 5);
+        });
+        let mut recv_buf = [0_u8; 16];
+        let (len, peer) = receiver.recv_from(&mut recv_buf).await.unwrap();
+        sender_handle.await.unwrap();
+        assert_eq!(&recv_buf[..len], b"owned");
+        assert_eq!(peer, send_addr);
+    });
+    ylong_runtime::block_on(handle).expect("block_on failed");
+}
+
+/// SDV test cases for `bind_with_owner` on IPv6.
+///
+/// # Brief
+/// 1. Create an IPv6 UdpSocket by `bind_with_owner` with the current
+///    uid/gid.
+/// 2. Check the socket owner is set to the expected uid/gid.
+/// 3. Check `local_addr()` is IPv6.
+#[test]
+#[cfg(target_os = "linux")]
+fn sdv_udp_bind_with_owner_ipv6() {
+    let handle = ylong_runtime::spawn(async {
+        let uid = unsafe { libc::getuid() };
+        let gid = unsafe { libc::getgid() };
+
+        let socket = UdpSocket::bind_with_owner("[::1]:0", uid, gid)
+            .await
+            .expect("Bind IPv6 Socket With Owner Failed");
+        let res = verify_udp_socket_ownership(&socket, uid, gid).unwrap();
+        assert!(res);
+        assert!(socket.local_addr().unwrap().is_ipv6());
+    });
+    ylong_runtime::block_on(handle).expect("block_on failed");
+}
+
+/// SDV test cases for `recv_from_truncated` with an oversized datagram.
+///
+/// # Brief
+/// 1. Send a datagram (300 bytes) larger than the receive buffer (64
+///    bytes).
+/// 2. `recv_from_truncated` returns the buffer-sized prefix, the peer
+///    address, and `truncated == true` (`recvmsg` `MSG_TRUNC`).
+#[test]
+#[cfg(target_os = "linux")]
+fn sdv_udp_recv_from_truncated_large() {
+    let handle = ylong_runtime::spawn(async {
+        let sender = UdpSocket::bind(ADDR).await.expect("Bind Sender Failed");
+        let receiver = UdpSocket::bind(ADDR).await.expect("Bind Receiver Failed");
+        let sender_addr = sender.local_addr().unwrap();
+        let receiver_addr = receiver.local_addr().unwrap();
+
+        let payload = [0x5A_u8; 300];
+        sender
+            .send_to(&payload, receiver_addr)
+            .await
+            .expect("Sender Send Failed");
+
+        let mut recv_buf = [0_u8; 64];
+        let (len, peer, truncated) = receiver
+            .recv_from_truncated(&mut recv_buf)
+            .await
+            .expect("Receiver Recv Failed");
+        assert_eq!(len, 64);
+        assert!(truncated);
+        assert_eq!(peer, sender_addr);
+        assert!(recv_buf.iter().all(|&b| b == 0x5A));
+    });
+    ylong_runtime::block_on(handle).expect("block_on failed");
+}
+
+/// SDV test cases for `recv_from_truncated` with a fitting datagram.
+///
+/// # Brief
+/// 1. Send a datagram (20 bytes) smaller than the receive buffer (64
+///    bytes).
+/// 2. `recv_from_truncated` returns the full datagram and
+///    `truncated == false`.
+#[test]
+#[cfg(target_os = "linux")]
+fn sdv_udp_recv_from_truncated_normal() {
+    let handle = ylong_runtime::spawn(async {
+        let sender = UdpSocket::bind(ADDR).await.expect("Bind Sender Failed");
+        let receiver = UdpSocket::bind(ADDR).await.expect("Bind Receiver Failed");
+        let sender_addr = sender.local_addr().unwrap();
+        let receiver_addr = receiver.local_addr().unwrap();
+
+        let payload = [0x3C_u8; 20];
+        sender
+            .send_to(&payload, receiver_addr)
+            .await
+            .expect("Sender Send Failed");
+
+        let mut recv_buf = [0_u8; 64];
+        let (len, peer, truncated) = receiver
+            .recv_from_truncated(&mut recv_buf)
+            .await
+            .expect("Receiver Recv Failed");
+        assert_eq!(len, 20);
+        assert!(!truncated);
+        assert_eq!(peer, sender_addr);
+        assert_eq!(&recv_buf[..len], &payload);
+    });
+    ylong_runtime::block_on(handle).expect("block_on failed");
+}
+
+/// SDV test cases for backward compatibility of `bind`.
+///
+/// # Brief
+/// 1. Create UdpSocket by `bind` without owner.
+/// 2. Check send_to/recv_from still work as before.
+#[test]
+fn sdv_udp_bind_owner_not_set() {
+    let handle = ylong_runtime::spawn(async {
+        let sender = UdpSocket::bind(ADDR).await.expect("Bind Socket Failed");
+        let receiver = UdpSocket::bind(ADDR).await.expect("Bind Socket Failed");
+        let sender_addr = sender.local_addr().unwrap();
+        let receiver_addr = receiver.local_addr().unwrap();
+
+        let n = sender
+            .send_to(b"Hello", receiver_addr)
+            .await
+            .expect("Sender Send Failed");
+        assert_eq!(n, "Hello".len());
+
+        let mut recv_buf = [0_u8; 12];
+        let (len, addr) = receiver.recv_from(&mut recv_buf[..]).await.unwrap();
+        assert_eq!(&recv_buf[..len], b"Hello");
+        assert_eq!(addr, sender_addr);
+    });
+    ylong_runtime::block_on(handle).expect("block_on failed");
 }

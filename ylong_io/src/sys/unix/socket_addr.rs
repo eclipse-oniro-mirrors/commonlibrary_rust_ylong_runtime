@@ -11,10 +11,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::io;
 use std::mem::size_of;
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 
-use libc::{sockaddr, socklen_t};
+use libc::{c_int, sockaddr, sockaddr_in, sockaddr_in6, sockaddr_storage, socklen_t};
 
 #[repr(C)]
 pub(crate) union SocketAddrLibC {
@@ -68,6 +69,44 @@ pub(crate) fn socket_addr_trans(addr: &SocketAddr) -> (SocketAddrLibC, socklen_t
                 SocketAddrLibC { v6: sockaddr_in6 },
                 size_of::<libc::sockaddr_in6>() as socklen_t,
             )
+        }
+    }
+}
+
+/// Converts a `sockaddr_storage` filled in by the kernel (by `recvmsg`,
+/// `accept`, ...) back into a Rust `SocketAddr`.
+///
+/// The fields are read explicitly: the byte layout of `std::net`
+/// address types is not guaranteed to match the libc `sockaddr_*`
+/// definitions, so a reinterpret cast is not portable.
+///
+/// # Safety
+///
+/// `storage` must point to a valid, initialized `sockaddr_storage` whose
+/// `ss_family` matches the address actually stored.
+pub(crate) unsafe fn trans_addr_2_socket(
+    storage: *const sockaddr_storage,
+) -> io::Result<SocketAddr> {
+    match (*storage).ss_family as c_int {
+        libc::AF_INET => {
+            let addr = &*storage.cast::<sockaddr_in>();
+            Ok(SocketAddr::V4(SocketAddrV4::new(
+                Ipv4Addr::from(u32::from_be(addr.sin_addr.s_addr)),
+                u16::from_be(addr.sin_port),
+            )))
+        }
+        libc::AF_INET6 => {
+            let addr = &*storage.cast::<sockaddr_in6>();
+            Ok(SocketAddr::V6(SocketAddrV6::new(
+                Ipv6Addr::from(addr.sin6_addr.s6_addr),
+                u16::from_be(addr.sin6_port),
+                addr.sin6_flowinfo,
+                addr.sin6_scope_id,
+            )))
+        }
+        _ => {
+            let err = io::Error::new(io::ErrorKind::Other, "Cannot transfer address into socket.");
+            Err(err)
         }
     }
 }

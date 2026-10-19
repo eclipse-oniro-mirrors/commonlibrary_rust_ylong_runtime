@@ -15,7 +15,7 @@ use std::net::SocketAddr;
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::{io, net};
 
-use libc::{c_int, AF_INET, AF_INET6, SOCK_DGRAM};
+use libc::{c_int, gid_t, uid_t, AF_INET, AF_INET6, SOCK_DGRAM};
 
 use super::super::socket_addr::socket_addr_trans;
 use crate::sys::socket::socket_new;
@@ -45,6 +45,29 @@ impl UdpSock {
         let udp_socket = UdpSocket {
             inner: unsafe { net::UdpSocket::from_raw_fd(self.socket) },
         };
+        let (raw_addr, addr_length) = socket_addr_trans(&addr);
+        match syscall!(bind(self.socket, raw_addr.as_ptr(), addr_length)) {
+            Err(err) if err.raw_os_error() != Some(libc::EINPROGRESS) => Err(err),
+            _ => Ok(udp_socket),
+        }
+    }
+
+    /// Creates a UDP socket from the given address after setting the socket
+    /// owner to the provided uid/gid.
+    /// return io::Error if errors happen.
+    ///
+    /// The socket owner is set by `fchown` before `bind`, so the owner is
+    /// effective before any packet can be sent through this socket.
+    pub(crate) fn bind_with_owner(
+        self,
+        addr: SocketAddr,
+        uid: uid_t,
+        gid: gid_t,
+    ) -> io::Result<UdpSocket> {
+        let udp_socket = UdpSocket {
+            inner: unsafe { net::UdpSocket::from_raw_fd(self.socket) },
+        };
+        syscall!(fchown(udp_socket.inner.as_raw_fd(), uid, gid))?;
         let (raw_addr, addr_length) = socket_addr_trans(&addr);
         match syscall!(bind(self.socket, raw_addr.as_ptr(), addr_length)) {
             Err(err) if err.raw_os_error() != Some(libc::EINPROGRESS) => Err(err),

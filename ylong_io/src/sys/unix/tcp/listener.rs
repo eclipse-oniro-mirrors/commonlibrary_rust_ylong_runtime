@@ -16,9 +16,10 @@ use std::mem::{size_of, MaybeUninit};
 use std::net::{self, SocketAddr};
 use std::os::unix::io::{AsRawFd, FromRawFd};
 
-use libc::{c_int, sockaddr_in, sockaddr_in6, sockaddr_storage, socklen_t};
+use libc::{sockaddr_storage, socklen_t};
 
 use super::{TcpSocket, TcpStream};
+use super::super::socket_addr::trans_addr_2_socket;
 use crate::source::Fd;
 #[cfg(target_os = "macos")]
 use crate::sys::socket::set_non_block;
@@ -154,21 +155,6 @@ impl TcpListener {
     /// ```
     pub fn take_error(&self) -> io::Result<Option<io::Error>> {
         self.inner.take_error()
-    }
-}
-
-pub(crate) unsafe fn trans_addr_2_socket(
-    storage: *const libc::sockaddr_storage,
-) -> io::Result<SocketAddr> {
-    match (*storage).ss_family as c_int {
-        libc::AF_INET => Ok(SocketAddr::V4(*(storage.cast::<sockaddr_in>().cast::<_>()))),
-        libc::AF_INET6 => Ok(SocketAddr::V6(
-            *(storage.cast::<sockaddr_in6>().cast::<_>()),
-        )),
-        _ => {
-            let err = io::Error::new(io::ErrorKind::Other, "Cannot transfer address into socket.");
-            Err(err)
-        }
     }
 }
 
