@@ -708,3 +708,31 @@ fn sdv_tcp_server_client_close() {
         ylong_runtime::block_on(handle).unwrap();
     }
 }
+
+/// SDV test cases for the peer address reported by `accept()`.
+///
+/// # Brief
+/// 1. Bind an IPv4 and an IPv6 `TcpListener`, connect to each from a
+///    client.
+/// 2. Accept and check the reported peer address equals the client's
+///    local address (ip and port), for both families.
+///
+/// This anchors the field-wise `trans_addr_2_socket` parsing: the
+/// previous bitwise reinterpretation of `sockaddr_storage` decoded
+/// `127.0.0.1:<port>` as garbage like `2.0.174.168:xx`, which fails
+/// these assertions.
+#[test]
+fn sdv_tcp_accept_peer_addr_roundtrip() {
+    let handle = ylong_runtime::spawn(async {
+        for addr in ["127.0.0.1:0", "[::1]:0"] {
+            let listener = TcpListener::bind(addr).await.expect("Bind Listener Failed");
+            let listener_addr = listener.local_addr().unwrap();
+            let client = TcpStream::connect(listener_addr).await.expect("Connect Failed");
+            let client_addr = client.local_addr().unwrap();
+            let (_, peer) = listener.accept().await.unwrap();
+            assert_eq!(peer, client_addr);
+            assert!(peer.ip().is_loopback());
+        }
+    });
+    ylong_runtime::block_on(handle).unwrap();
+}
