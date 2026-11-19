@@ -19,6 +19,7 @@ ohos_rust_shared_library("ylong_runtime") {
 
   crate_name = "ylong_runtime"
   edition = "2021"
+  version_script = "ylong_runtime.versionscript"
 
   features = [
     "fs",
